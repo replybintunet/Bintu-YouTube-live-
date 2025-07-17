@@ -2,7 +2,6 @@ import { spawn, ChildProcess } from 'child_process';
 import fs from 'fs/promises';
 
 export interface StreamConfig {
-  streamId: number;  // 👈 required to uniquely identify each stream
   streamKey: string;
   quality: string;
   inputFile: string;
@@ -11,27 +10,57 @@ export interface StreamConfig {
   streamMode?: 'desktop' | 'mobile';
 }
 
+export interface StreamStatus {
+  isStreaming: boolean;
+  connectionStatus: 'disconnected' | 'connecting' | 'connected';
+  uploadSpeed: string;
+  droppedFrames: number;
+  duration: string;
+}
+
 export class YouTubeStreamService {
   private processes: Map<number, ChildProcess> = new Map();
+  private statuses: Map<number, StreamStatus> = new Map();
+  private startTimes: Map<number, Date> = new Map();
 
-  async startStream(config: StreamConfig): Promise<void> {
-    if (this.processes.has(config.streamId)) {
-      throw new Error(`Stream ${config.streamId} is already running`);
+  constructor() {
+    // Update durations every second
+    setInterval(() => {
+      for (const [streamId, startTime] of this.startTimes) {
+        const elapsed = Date.now() - startTime.getTime();
+        const status = this.statuses.get(streamId);
+        if (status?.isStreaming) {
+          status.duration = this.formatDuration(elapsed);
+        }
+      }
+    }, 1000);
+  }
+
+  async startStream(config: StreamConfig, streamId: number) {
+    if (this.processes.has(streamId)) {
+      throw new Error(`Stream ${streamId} is already running`);
     }
 
-    await fs.access(config.inputFile); // check file exists
+    // Validate input file exists
+    await fs.access(config.inputFile);
+
+    const status: StreamStatus = {
+      isStreaming: false,
+      connectionStatus: 'connecting',
+      uploadSpeed: '0 Mbps',
+      droppedFrames: 0,
+      duration: '00:00:00'
+    };
+    this.statuses.set(streamId, status);
 
     const rtmpUrl = `rtmp://a.rtmp.youtube.com/live2/${config.streamKey}`;
 
-    const args: string[] = [
-      '-re',
-    ];
-
+    const ffmpegArgs = ['-re'];
     if (config.loop) {
-      args.push('-stream_loop', '-1');
+      ffmpegArgs.push('-stream_loop', '-1');
     }
 
-    args.push(
+    ffmpegArgs.push(
       '-i', config.inputFile,
       '-c:v', 'libx264',
       '-preset', 'fast',
@@ -46,41 +75,86 @@ export class YouTubeStreamService {
       rtmpUrl
     );
 
-    console.log(`Starting stream ${config.streamId} with ffmpeg: ffmpeg ${args.join(' ')}`);
+    const process = spawn('ffmpeg', ffmpegArgs);
 
-    const proc = spawn('ffmpeg', args);
+    this.processes.set(streamId, process);
+    this.startTimes.set(streamId, new Date());
 
-    proc.stderr?.on('data', (data) => {
-      console.log(`[Stream ${config.streamId}] ${data.toString()}`);
+    process.stderr?.on('data', (data) => {
+      const output = data.toString();
+      this.parseFFmpegOutput(output, streamId);
+
+      if (
+        output.includes('Connection refused') ||
+        output.includes('404 Not Found') ||
+        output.includes('403 Forbidden') ||
+        output.includes('HTTP error') ||
+        output.includes('No such file or directory')
+      ) {
+        this.stopStream(streamId);
+      }
     });
 
-    proc.on('close', (code) => {
-      console.log(`Stream ${config.streamId} ended with code ${code}`);
-      this.processes.delete(config.streamId);
-    });
-
-    this.processes.set(config.streamId, proc);
-  }
-
-  stopStream(streamId: number): void {
-    const proc = this.processes.get(streamId);
-    if (proc) {
-      proc.kill('SIGTERM');
+    process.on('close', () => {
       this.processes.delete(streamId);
-      console.log(`Stopped stream ${streamId}`);
-    } else {
-      throw new Error(`Stream ${streamId} is not running`);
-    }
+      this.startTimes.delete(streamId);
+      const st = this.statuses.get(streamId);
+      if (st) {
+        st.isStreaming = false;
+        st.connectionStatus = 'disconnected';
+      }
+    });
+
+    // Wait to confirm process is running
+    await new Promise<void>((resolve, reject) => {
+      setTimeout(() => {
+        if (!process.killed) {
+          status.isStreaming = true;
+          status.connectionStatus = 'connected';
+          resolve();
+        } else {
+          reject(new Error('Failed to start stream'));
+        }
+      }, 2000);
+    });
   }
 
-  stopAll(): void {
-    for (const streamId of this.processes.keys()) {
-      this.stopStream(streamId);
+  stopStream(streamId: number) {
+    const process = this.processes.get(streamId);
+    if (process) {
+      process.kill('SIGTERM');
+      this.processes.delete(streamId);
     }
+
+    const st = this.statuses.get(streamId);
+    if (st) {
+      st.isStreaming = false;
+      st.connectionStatus = 'disconnected';
+      st.uploadSpeed = '0 Mbps';
+      st.droppedFrames = 0;
+      st.duration = '00:00:00';
+    }
+
+    this.startTimes.delete(streamId);
   }
 
-  getActiveStreams(): number[] {
-    return Array.from(this.processes.keys());
+  getStatus(streamId: number): StreamStatus | null {
+    return this.statuses.get(streamId) || null;
+  }
+
+  private parseFFmpegOutput(output: string, streamId: number) {
+    const st = this.statuses.get(streamId);
+    if (!st) return;
+
+    const speedMatch = output.match(/speed=\s*([0-9.]+)x/);
+    if (speedMatch) {
+      const speed = parseFloat(speedMatch[1]);
+      st.uploadSpeed = `${(speed * 2).toFixed(1)} Mbps`;
+    }
+
+    if (output.includes('drop') || output.includes('error')) {
+      st.droppedFrames++;
+    }
   }
 
   private getMaxRate(quality: string): string {
@@ -120,9 +194,22 @@ export class YouTubeStreamService {
   }
 
   private getVideoFilter(quality: string, streamMode: string): string {
-    const resolution = streamMode === 'mobile'
-      ? this.getMobileResolution(quality)
-      : this.getResolution(quality);
-    return `scale=${resolution}:force_original_aspect_ratio=decrease,pad=${resolution}:(ow-iw)/2:(oh-ih)/2`;
+    if (streamMode === 'mobile') {
+      const mobileRes = this.getMobileResolution(quality);
+      return `scale=${mobileRes}:force_original_aspect_ratio=decrease,pad=${mobileRes}:(ow-iw)/2:(oh-ih)/2`;
+    }
+
+    const res = this.getResolution(quality);
+    return `scale=${res}:force_original_aspect_ratio=decrease,pad=${res}:(ow-iw)/2:(oh-ih)/2`;
+  }
+
+  private formatDuration(ms: number): string {
+    const seconds = Math.floor(ms / 1000);
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = seconds % 60;
+    return `${hours.toString().padStart(2, '0')}:${minutes
+      .toString()
+      .padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   }
 }

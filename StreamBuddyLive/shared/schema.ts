@@ -12,7 +12,8 @@ export const streams = pgTable("streams", {
   id: serial("id").primaryKey(),
   userId: integer("user_id").references(() => users.id),
   title: text("title").notNull(),
-  streamKey: text("stream_key").notNull(),
+  streamKey1: text("stream_key_1").notNull(),
+  streamKey2: text("stream_key_2").notNull(),
   quality: text("quality").notNull().default("1080p"),
   status: text("status").notNull().default("offline"), // offline, connecting, live, stopping
   isActive: boolean("is_active").notNull().default(false),
@@ -44,6 +45,7 @@ export const activityLogs = pgTable("activity_logs", {
   timestamp: timestamp("timestamp").defaultNow(),
 });
 
+// Zod insert schemas
 export const insertUserSchema = createInsertSchema(users).pick({
   username: true,
   password: true,
@@ -51,7 +53,8 @@ export const insertUserSchema = createInsertSchema(users).pick({
 
 export const insertStreamSchema = createInsertSchema(streams).pick({
   title: true,
-  streamKey: true,
+  streamKey1: true,
+  streamKey2: true,
   quality: true,
 });
 
@@ -70,11 +73,15 @@ export const insertActivityLogSchema = createInsertSchema(activityLogs).pick({
   level: true,
 });
 
+// Type exports
 export type InsertUser = z.infer<typeof insertUserSchema>;
 export type User = typeof users.$inferSelect;
+
 export type InsertStream = z.infer<typeof insertStreamSchema>;
 export type Stream = typeof streams.$inferSelect;
+
 export type InsertStreamStats = z.infer<typeof insertStreamStatsSchema>;
 export type StreamStats = typeof streamStats.$inferSelect;
+
 export type InsertActivityLog = z.infer<typeof insertActivityLogSchema>;
 export type ActivityLog = typeof activityLogs.$inferSelect;
